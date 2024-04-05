@@ -183,7 +183,7 @@ class TransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None
     ):
         x_input = None
-        topk_mask = None
+        expanded_topk_mask = None
 
         if capacity == 1.0:
             x_input = x
@@ -198,7 +198,8 @@ class TransformerBlock(nn.Module):
 
             topk_mask = torch.zeros_like(token_probs, dtype=torch.bool)
             topk_mask.scatter_(1, topk_indices, True)
-            x_input = x[topk_mask].view(b, capacity, m)
+            expanded_topk_mask = topk_mask.unsqueeze(-1).expand(-1, -1, m)
+            x_input = x.masked_select(expanded_topk_mask).view(b, capacity, m)
 
         h = x_input + \
             self.attention.forward(
@@ -206,7 +207,7 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
 
         if capacity != 1.0:
-            x[topk_mask] = out.view(-1, m)
+            x = x.masked_scatter(expanded_topk_mask, out.view(-1, m))
             return x
 
         return out
@@ -255,6 +256,9 @@ class Transformer(nn.Module):
         # Initialize attribute for block usage penalty
         self.block_penalty = 0.5
 
+        # Initialize attribute for MoD capacity
+        self.capacity = 0.125
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -280,9 +284,13 @@ class Transformer(nn.Module):
 
         while True:
             # get the layer to route to by the max of the router
-            layer_probs = self.block_router(h)
-            layer = torch.argmax(layer_probs, dim=-1).item()
-            h = self.layers[layer](h, freqs_cos, freqs_sin, attn_mask)
+            logits_per_position = self.routing_layer(h)
+            averaged_logits = torch.mean(logits_per_position, dim=1)
+            probabilities = F.softmax(averaged_logits, dim=-1)
+            layer = torch.argmax(probabilities, dim=-1).item()
+            block_capacity = 1.0 if blocks_used % 2 == 0 else self.capacity
+            h = self.layers[layer](
+                h, freqs_cos, freqs_sin, block_capacity, attn_mask)
 
             # if router selects last option, we are done
             if layer == self.n_layers:
