@@ -162,6 +162,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
+        self.depth_router = Router(args.dim, 1)
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -178,12 +179,36 @@ class TransformerBlock(nn.Module):
         x,
         freqs_cos,
         freqs_sin,
+        capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
-        h = x + \
+        x_input = None
+        topk_mask = None
+
+        if capacity == 1.0:
+            x_input = x
+        else:
+            b, n, m = x.size()
+
+            capacity = max(1, int(capacity * n))
+            token_probs = F.softmax(self.depth_router(x), dim=1)
+
+            _, topk_indices = torch.topk(
+                token_probs, k=capacity, dim=1, sorted=False)
+
+            topk_mask = torch.zeros_like(token_probs, dtype=torch.bool)
+            topk_mask.scatter_(1, topk_indices, True)
+            x_input = x[topk_mask].view(b, capacity, m)
+
+        h = x_input + \
             self.attention.forward(
-                self.attention_norm(x), freqs_cos, freqs_sin, attn_mask)
+                self.attention_norm(x_input), freqs_cos, freqs_sin, attn_mask)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
+
+        if capacity != 1.0:
+            x[topk_mask] = out.view(-1, m)
+            return x
+
         return out
 
 
