@@ -1,9 +1,8 @@
 import math
 from dataclasses import dataclass
 from typing import Optional
-from utils import precompute_freqs_cis, apply_rotary_emb, repeat_kv
+from model_utils import precompute_freqs_cis, apply_rotary_emb, repeat_kv
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
