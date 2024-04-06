@@ -88,7 +88,7 @@ for epoch in range(epochs):
         model(inputs, targets=targets, attn_mask=attn_masks)
         base_loss = model.last_base_loss
         total_loss = model.last_total_loss
-        blocks_used = model.last_blocks_used
+        blocks_used = model.last_regions_used
 
         del inputs, targets
 

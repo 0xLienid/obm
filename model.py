@@ -14,6 +14,7 @@ class ModelArgs:
     # default hyperparameters for the Llama 7B model
     dim: int = 4096
     n_layers: int = 32
+    n_regions: int = 8
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = 32000
@@ -33,7 +34,17 @@ class Router(torch.nn.Module):
         if as_zeros:
             nn.init.constant_(self.router.weight, 0.0)
 
-    def forward(self, x):
+    def forward(self, x, blocks_used: Optional[int] = 0, last_block: Optional[int] = None):
+        _, n, _ = x.shape
+
+        # Make blocks_used and last_block the last two elements in each embedding dimension
+        if blocks_used is not None and last_block is not None:
+            blocks_used_tensor = torch.full(
+                (1, n, 1), blocks_used, dtype=x.dtype, device=x.device)
+            last_block_tensor = torch.full(
+                (1, n, 1), last_block, dtype=x.dtype, device=x.device)
+            x = torch.cat((x, blocks_used_tensor, last_block_tensor), dim=2)
+
         return self.norm(self.router(x))
 
 
@@ -184,6 +195,28 @@ class TransformerBlock(nn.Module):
         return out
 
 
+class Region(nn.Module):
+    def __init__(self, id: int, depth: int, params: ModelArgs):
+        super().__init__()
+        self.id = id
+        self.global_id = id * depth
+        self.depth = depth
+        self.params = params
+        self.blocks = torch.nn.ModuleList()
+        for block_id in range(depth):
+            self.blocks.append(TransformerBlock(
+                self.global_id + block_id, params))
+
+        # Initialize attribute for MoD capacity
+        self.capacity = 0.125
+
+    def forward(self, x):
+        for i, block in enumerate(self.blocks):
+            block_capacity = 1.0 if i % 2 == 0 else self.capacity
+            x = block(x, block_capacity)
+        return x
+
+
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
 
@@ -192,16 +225,15 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.n_regions = params.n_regions
+        self.region_depth = params.n_layers // params.n_regions
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.block_router = Router(params.dim, params.n_layers)
-        self.block_to_block_router = Router(1, params.n_layers)
-        self.halt_router = Router(params.dim, 1, True)
-        self.halt_threshold = nn.Parameter(torch.tensor(0.7))
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+        self.region_router = Router(params.dim + 2, params.n_regions + 1)
+        self.regions = torch.nn.ModuleList()
+        for region_id in range(params.n_regions):
+            self.regions.append(Region(region_id, self.region_depth, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
@@ -220,12 +252,12 @@ class Transformer(nn.Module):
         # Initialize attributes for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_base_loss = None
         self.last_total_loss = None
-        self.last_blocks_used = None
+        self.last_regions_used = None
 
         # Initialize attributes for block usage
         # theoretically there should be no max block usage, but using this for now
-        self.max_block_usage = 64
-        self.block_penalty = 1.0
+        self.max_region_usage = self.n_regions * 2
+        self.region_penalty = 0.1
         self.reuse_penalty = 0.25
 
         # Initialize attribute for MoD capacity
@@ -250,51 +282,28 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
 
-        # get the layer to route to by the max of the router
-        logits_per_position = self.block_router(h)
-        averaged_logits = torch.mean(logits_per_position, dim=1)
-        probabilities = F.softmax(averaged_logits, dim=-1)
-        layer = torch.multinomial(
-            probabilities.squeeze(), num_samples=1).item()
-        block_capacity = 1.0
-        h = self.layers[layer](
-            h, block_capacity)
-
-        blocks_used = 1
+        regions_used = 0
         sequential_reuse = 0
-        last_block = layer
+        last_region = -1.0
 
-        while blocks_used < self.max_block_usage:
-            # check if we should halt
-            halt_logits = self.halt_router(h)
-            avg_halt_logit = torch.mean(halt_logits, dim=1)
-            halt_probability = torch.sigmoid(avg_halt_logit)
+        while regions_used < self.max_region_usage:
+            # get the region to route to by the max of the router
+            logits_per_position = self.region_router(
+                h, regions_used / self.n_regions, last_region / self.n_regions)
+            averaged_logits = torch.mean(logits_per_position, dim=1)
+            probabilities = F.softmax(
+                averaged_logits, dim=-1)
+            region = torch.multinomial(probabilities.squeeze(), 1).item()
 
-            if halt_probability.item() > self.halt_threshold:
+            if region == self.n_regions:
                 break
 
-            # get the layer to route to by the max of the router
-            logits_per_position = self.block_router(h)
-            averaged_logits = torch.mean(
-                logits_per_position, dim=1)  # shape (1, n_layers)
-            logits_per_layer = self.block_to_block_router(torch.tensor(
-                last_block).float().unsqueeze(0).unsqueeze(0))  # shape (1, n_layers)
-            agg_logits = averaged_logits * logits_per_layer
-            probabilities = F.softmax(
-                agg_logits, dim=-1)  # shape (1, n_layers)
-
-            layer = torch.multinomial(probabilities[0], num_samples=1).item()
-
-            if layer == last_block:
+            if region == last_region:
                 sequential_reuse += 1
 
-            last_block = layer
-
-            block_capacity = 1.0 if blocks_used % 2 == 0 else self.capacity
-            h = self.layers[layer](
-                h, block_capacity)
-
-            blocks_used += 1
+            last_region = region
+            regions_used += 1
+            h = self.regions[region](h)
 
         h = self.norm(h)
 
@@ -308,17 +317,16 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + self.block_penalty * \
-                (((blocks_used / self.n_layers) - 1) ** 2) + \
+            self.last_total_loss = self.last_base_loss + self.region_penalty * regions_used + \
                 self.reuse_penalty * sequential_reuse
-            self.last_blocks_used = blocks_used
+            self.last_regions_used = regions_used
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             # note: using list [-1] to preserve the time dim
             logits = self.output(h[:, [-1], :])
             self.last_base_loss = None
             self.last_total_loss = None
-            self.last_blocks_used = None
+            self.last_regions_used = None
 
         return logits
 
