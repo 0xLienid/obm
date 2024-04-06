@@ -2,6 +2,24 @@ import torch
 from typing import Tuple
 
 
+def gumbel_softmax(logits, temperature=1.0, hard=False):
+    # Sample from Gumbel(0, 1)
+    gumbels = -torch.empty_like(logits).exponential_().log()
+    # Add the Gumbel noise and apply temperature
+    gumbels = (logits + gumbels) / temperature
+    y_soft = gumbels.softmax(dim=-1)
+
+    if hard:
+        # Create a hard one-hot vector
+        index = y_soft.max(dim=-1, keepdim=True)[1]
+        y_hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+        # Use straight-through estimator to keep the gradient flow
+        y = y_hard - y_soft.detach() + y_soft
+    else:
+        y = y_soft
+    return y
+
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
                    [: (dim // 2)].float() / dim))

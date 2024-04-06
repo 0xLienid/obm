@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 from typing import Optional
-from model_utils import precompute_freqs_cis, apply_rotary_emb, repeat_kv
+from model_utils import gumbel_softmax
 
 import torch
 import torch.nn.functional as F
@@ -26,13 +26,10 @@ class ModelArgs:
 
 
 class Router(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, as_zeros: Optional[bool] = False):
+    def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
-        self.router = nn.Linear(input_dim, output_dim, bias=False)
-        self.norm = RMSNorm(output_dim, eps=1e-5)
-
-        if as_zeros:
-            nn.init.constant_(self.router.weight, 0.0)
+        self.w1 = nn.Linear(input_dim, input_dim * 2, bias=False)
+        self.w2 = nn.Linear(input_dim * 2, output_dim, bias=False)
 
     def forward(self, x, blocks_used: Optional[int] = 0, last_block: Optional[int] = None):
         _, n, _ = x.shape
@@ -45,7 +42,7 @@ class Router(torch.nn.Module):
                 (1, n, 1), last_block, dtype=x.dtype, device=x.device)
             x = torch.cat((x, blocks_used_tensor, last_block_tensor), dim=2)
 
-        return self.norm(self.router(x))
+        return self.w2(F.silu(self.w1(x)))
 
 
 class RMSNorm(torch.nn.Module):
@@ -141,7 +138,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.depth_router = Router(args.dim, 1)
+        self.depth_router = nn.Linear(args.dim, 1, bias=False)
         self.attention = CausalSelfAttention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -166,7 +163,7 @@ class TransformerBlock(nn.Module):
         if capacity == 1.0:
             x_input = x
         else:
-            b, n, m = x.shape
+            _, n, m = x.shape
 
             capacity = max(1, int(capacity * n))
             token_logits = self.depth_router(x)
@@ -257,8 +254,7 @@ class Transformer(nn.Module):
         # Initialize attributes for block usage
         # theoretically there should be no max block usage, but using this for now
         self.max_region_usage = self.n_regions * 2
-        self.region_penalty = 0.1
-        self.reuse_penalty = 0.25
+        self.region_penalty = 0.02
 
         # Initialize attribute for MoD capacity
         self.capacity = 0.125
@@ -283,7 +279,6 @@ class Transformer(nn.Module):
         h = self.dropout(h)
 
         regions_used = 0
-        sequential_reuse = 0
         last_region = -1.0
 
         while regions_used < self.max_region_usage:
@@ -291,15 +286,12 @@ class Transformer(nn.Module):
             logits_per_position = self.region_router(
                 h, regions_used / self.n_regions, last_region / self.n_regions)
             averaged_logits = torch.mean(logits_per_position, dim=1)
-            probabilities = F.softmax(
-                averaged_logits, dim=-1)
-            region = torch.multinomial(probabilities.squeeze(), 1).item()
+            probabilities = gumbel_softmax(
+                averaged_logits, temperature=0.8, hard=False)
+            region = torch.argmax(probabilities, dim=-1).item()
 
             if region == self.n_regions:
                 break
-
-            if region == last_region:
-                sequential_reuse += 1
 
             last_region = region
             regions_used += 1
@@ -317,8 +309,8 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + self.region_penalty * regions_used + \
-                self.reuse_penalty * sequential_reuse
+            self.last_total_loss = self.last_base_loss + self.region_penalty * \
+                (((regions_used - self.n_regions) / self.n_regions) ** 2)
             self.last_regions_used = regions_used
         else:
             # inference-time mini-optimization: only forward the output on the very last position

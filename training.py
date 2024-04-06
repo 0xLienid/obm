@@ -31,6 +31,7 @@ dtype = "bfloat16"
 model_args = ModelArgs(
     dim=512,
     n_layers=32,
+    n_regions=8,
     n_heads=32,
     vocab_size=50257,
     hidden_dim=1024,
