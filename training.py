@@ -14,12 +14,12 @@ load_dotenv()
 model_name = "obm"
 run_id = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 epochs = 1
-accumulation_steps = 8
+accumulation_steps = 32
 batch_size = 1
 lr = 3e-4
 min_lr = 3e-5
 eval_steps = 250
-training_steps = 1024
+training_steps = 10000
 weight_decay = 0.01
 lr_decay_steps = training_steps // accumulation_steps
 grad_clip = 1.0
@@ -33,7 +33,7 @@ model_args = ModelArgs(
     n_layers=32,
     n_heads=32,
     vocab_size=50257,
-    hidden_dim=2048,
+    hidden_dim=1024,
     multiple_of=256,
     norm_eps=1e-5,
     max_seq_len=512,
@@ -88,6 +88,7 @@ for epoch in range(epochs):
         model(inputs, targets=targets, attn_mask=attn_masks)
         base_loss = model.last_base_loss
         total_loss = model.last_total_loss
+        blocks_used = model.last_blocks_used
 
         del inputs, targets
 
@@ -114,14 +115,14 @@ for epoch in range(epochs):
             optimizer.zero_grad(set_to_none=True)
 
             print(
-                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}")
+                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}, Blocks used: {blocks_used}")
             try:
                 run.log({"base_loss": base_loss.item(), "total_loss": total_loss.item(
-                ) * accumulation_steps, "grad_norm": total_norm})
+                ) * accumulation_steps, "grad_norm": total_norm, "blocks_used": blocks_used})
             except:
                 print(f"Failed to push training data to wandb")
 
-        del total_loss, base_loss
+        del total_loss, base_loss, blocks_used
 
         if (global_step + 1) % eval_steps == 0:
             model.eval()

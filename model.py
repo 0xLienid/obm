@@ -5,6 +5,7 @@ from model_utils import precompute_freqs_cis, apply_rotary_emb, repeat_kv
 
 import torch
 import torch.nn.functional as F
+import torch.distributions as dist
 from torch import nn
 
 
@@ -24,12 +25,16 @@ class ModelArgs:
 
 
 class Router(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+    def __init__(self, input_dim: int, output_dim: int, as_zeros: Optional[bool] = False):
         super().__init__()
         self.router = nn.Linear(input_dim, output_dim, bias=False)
+        self.norm = RMSNorm(output_dim, eps=1e-5)
+
+        if as_zeros:
+            nn.init.constant_(self.router.weight, 0.0)
 
     def forward(self, x):
-        return F.softmax(self.router(x), dim=-1)
+        return self.norm(self.router(x))
 
 
 class RMSNorm(torch.nn.Module):
@@ -46,96 +51,60 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-class Attention(nn.Module):
+class CausalSelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        assert args.n_heads % self.n_kv_heads == 0
-        model_parallel_size = 1
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads *
-                            self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads *
-                            self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        assert args.dim % args.n_heads == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(args.dim, 3 * args.dim, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(args.dim, args.dim, bias=False)
+        # regularization
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
+        self.n_heads = args.n_heads
+        self.dim = args.dim
         self.dropout = args.dropout
-
-        # use flash attention or a manual implementation?
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional,
                              'scaled_dot_product_attention')
+        if not self.flash:
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(args.max_seq_len, args.max_seq_len))
+                                 .view(1, 1, args.max_seq_len, args.max_seq_len))
 
-        mask = torch.full(
-            (1, 1, args.max_seq_len, args.max_seq_len), torch.finfo(torch.bfloat16).min)
-        mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask)
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None
-    ):
-        bsz, seqlen, _ = x.shape
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.dim, dim=2)
+        k = k.view(B, T, self.n_heads, C //
+                   self.n_heads).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_heads, C //
+                   self.n_heads).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_heads, C //
+                   self.n_heads).transpose(1, 2)  # (B, nh, T, hs)
 
-        # QKV
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-        # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
-
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
-
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(1).repeat(
-                1, seqlen, 1).to(dtype=x.dtype)
-            attn_mask = attn_mask.masked_fill(attn_mask == 0, torch.finfo(
-                torch.bfloat16).min).masked_fill(attn_mask == 1, 0)
-            combined_mask = self.mask[:, :, :seqlen,
-                                      :seqlen] + attn_mask.unsqueeze(1)
-        else:
-            combined_mask = self.mask[:, :, :seqlen, :seqlen]
-
-        # flash implementation
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(
-                xq, xk, xv, attn_mask=combined_mask)
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
         else:
-            # manual implementation
-            scores = torch.matmul(xq, xk.transpose(2, 3)) / \
-                math.sqrt(self.head_dim)
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-            assert hasattr(self, 'mask')
-            # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = scores + combined_mask
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            # (bs, n_local_heads, seqlen, head_dim)
-            output = torch.matmul(scores, xv)
-
-        # restore time as batch dimension and concat heads
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
-        # final projection into the residual stream
-        output = self.wo(output)
-        output = self.resid_dropout(output)
-        return output
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class FeedForward(nn.Module):
@@ -162,7 +131,7 @@ class TransformerBlock(nn.Module):
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
         self.depth_router = Router(args.dim, 1)
-        self.attention = Attention(args)
+        self.attention = CausalSelfAttention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=args.hidden_dim,
@@ -176,37 +145,40 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        freqs_cos,
-        freqs_sin,
         capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
         x_input = None
-        expanded_topk_mask = None
+        indices_expanded = None
+        weights = None
 
         if capacity == 1.0:
             x_input = x
         else:
-            b, n, m = x.size()
+            b, n, m = x.shape
 
             capacity = max(1, int(capacity * n))
-            token_probs = F.softmax(self.depth_router(x), dim=1)
+            token_logits = self.depth_router(x)
+            weights, selected_tokens = torch.topk(
+                token_logits, capacity, dim=1, sorted=False)
 
-            _, topk_indices = torch.topk(
-                token_probs, k=capacity, dim=1, sorted=False)
-
-            topk_mask = torch.zeros_like(token_probs, dtype=torch.bool)
-            topk_mask.scatter_(1, topk_indices, True)
-            expanded_topk_mask = topk_mask.unsqueeze(-1).expand(-1, -1, m)
-            x_input = x.masked_select(expanded_topk_mask).view(b, capacity, m)
+            selected_tokens, index = torch.sort(selected_tokens, dim=1)
+            weights = torch.gather(weights, dim=1, index=index)
+            indices_expanded = selected_tokens.expand(-1, -1, m)
+            x_input = torch.gather(x, 1, indices_expanded)
 
         h = x_input + \
             self.attention.forward(
-                self.attention_norm(x_input), freqs_cos, freqs_sin, attn_mask)
+                self.attention_norm(x_input))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
 
         if capacity != 1.0:
-            x = x.masked_scatter(expanded_topk_mask, out.view(-1, m))
+            x = torch.scatter_add(
+                x,
+                dim=1,
+                index=indices_expanded,
+                src=h * weights,
+            )
             return x
 
         return out
@@ -223,7 +195,10 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.block_router = Router(params.dim, params.n_layers + 1)
+        self.block_router = Router(params.dim, params.n_layers)
+        self.block_to_block_router = Router(1, params.n_layers)
+        self.halt_router = Router(params.dim, 1, True)
+        self.halt_threshold = nn.Parameter(torch.tensor(0.7))
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
@@ -233,12 +208,6 @@ class Transformer(nn.Module):
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
         self.tok_embeddings.weight = self.output.weight
-
-        # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # init all weights
         self.apply(self._init_weights)
@@ -251,9 +220,13 @@ class Transformer(nn.Module):
         # Initialize attributes for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_base_loss = None
         self.last_total_loss = None
+        self.last_blocks_used = None
 
-        # Initialize attribute for block usage penalty
-        self.block_penalty = 0.5
+        # Initialize attributes for block usage
+        # theoretically there should be no max block usage, but using this for now
+        self.max_block_usage = 64
+        self.block_penalty = 1.0
+        self.reuse_penalty = 0.25
 
         # Initialize attribute for MoD capacity
         self.capacity = 0.125
@@ -276,24 +249,50 @@ class Transformer(nn.Module):
         _, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        freqs_cos = self.freqs_cos[:seqlen]
-        freqs_sin = self.freqs_sin[:seqlen]
 
-        blocks_used = 0
+        # get the layer to route to by the max of the router
+        logits_per_position = self.block_router(h)
+        averaged_logits = torch.mean(logits_per_position, dim=1)
+        probabilities = F.softmax(averaged_logits, dim=-1)
+        layer = torch.multinomial(
+            probabilities.squeeze(), num_samples=1).item()
+        block_capacity = 1.0
+        h = self.layers[layer](
+            h, block_capacity)
 
-        while True:
+        blocks_used = 1
+        sequential_reuse = 0
+        last_block = layer
+
+        while blocks_used < self.max_block_usage:
+            # check if we should halt
+            halt_logits = self.halt_router(h)
+            avg_halt_logit = torch.mean(halt_logits, dim=1)
+            halt_probability = torch.sigmoid(avg_halt_logit)
+
+            if halt_probability.item() > self.halt_threshold:
+                break
+
             # get the layer to route to by the max of the router
-            logits_per_position = self.routing_layer(h)
-            averaged_logits = torch.mean(logits_per_position, dim=1)
-            probabilities = F.softmax(averaged_logits, dim=-1)
-            layer = torch.argmax(probabilities, dim=-1).item()
+            logits_per_position = self.block_router(h)
+            averaged_logits = torch.mean(
+                logits_per_position, dim=1)  # shape (1, n_layers)
+            logits_per_layer = self.block_to_block_router(torch.tensor(
+                last_block).float().unsqueeze(0).unsqueeze(0))  # shape (1, n_layers)
+            agg_logits = averaged_logits * logits_per_layer
+            probabilities = F.softmax(
+                agg_logits, dim=-1)  # shape (1, n_layers)
+
+            layer = torch.multinomial(probabilities[0], num_samples=1).item()
+
+            if layer == last_block:
+                sequential_reuse += 1
+
+            last_block = layer
+
             block_capacity = 1.0 if blocks_used % 2 == 0 else self.capacity
             h = self.layers[layer](
-                h, freqs_cos, freqs_sin, block_capacity, attn_mask)
-
-            # if router selects last option, we are done
-            if layer == self.n_layers:
-                break
+                h, block_capacity)
 
             blocks_used += 1
 
@@ -309,13 +308,17 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + self.block_penalty * blocks_used
+            self.last_total_loss = self.last_base_loss + self.block_penalty * \
+                (((blocks_used / self.n_layers) - 1) ** 2) + \
+                self.reuse_penalty * sequential_reuse
+            self.last_blocks_used = blocks_used
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             # note: using list [-1] to preserve the time dim
             logits = self.output(h[:, [-1], :])
             self.last_base_loss = None
             self.last_total_loss = None
+            self.last_blocks_used = None
 
         return logits
 
