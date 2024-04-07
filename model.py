@@ -30,19 +30,34 @@ class Router(torch.nn.Module):
         super().__init__()
         self.w1 = nn.Linear(input_dim, input_dim * 2, bias=False)
         self.w2 = nn.Linear(input_dim * 2, output_dim, bias=False)
+        self.norm = RMSNorm(output_dim, eps=1e-5)
 
-    def forward(self, x, blocks_used: Optional[int] = 0, last_block: Optional[int] = None):
+    def forward(self, x, blocks_used: Optional[int] = 0, last_blocks: Optional = None):
         _, n, _ = x.shape
 
-        # Make blocks_used and last_block the last two elements in each embedding dimension
-        if blocks_used is not None and last_block is not None:
+        # Make blocks_used and last_blocks the last two elements in each embedding dimension
+        if blocks_used is not None and last_blocks is not None:
             blocks_used_tensor = torch.full(
                 (1, n, 1), blocks_used, dtype=x.dtype, device=x.device)
-            last_block_tensor = torch.full(
-                (1, n, 1), last_block, dtype=x.dtype, device=x.device)
-            x = torch.cat((x, blocks_used_tensor, last_block_tensor), dim=2)
+            last_blocks_tensor = torch.tensor(
+                last_blocks, dtype=x.dtype, device=x.device).repeat(n, 1).unsqueeze(0)
+            x = torch.cat((x, blocks_used_tensor, last_blocks_tensor), dim=2)
 
-        return self.w2(F.silu(self.w1(x)))
+        return self.norm(self.w2(F.silu(self.w1(x))))
+
+
+class HaltRouter(nn.Module):
+    def __init__(self, input_dim: int, seq_len: int):
+        super().__init__()
+        self.seq_len = seq_len
+        self.w1 = nn.Linear(input_dim, 1, bias=False)
+        self.w2 = nn.Linear(seq_len, 1, bias=False)
+
+    def forward(self, x):
+        x = self.w1(x)
+        x = x.view(-1, self.seq_len)
+        x = self.w2(x)
+        return x
 
 
 class RMSNorm(torch.nn.Module):
@@ -139,6 +154,7 @@ class TransformerBlock(nn.Module):
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
         self.depth_router = nn.Linear(args.dim, 1, bias=False)
+        self.dr_norm = RMSNorm(1, eps=args.norm_eps)
         self.attention = CausalSelfAttention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -166,7 +182,7 @@ class TransformerBlock(nn.Module):
             _, n, m = x.shape
 
             capacity = max(1, int(capacity * n))
-            token_logits = self.depth_router(x)
+            token_logits = self.dr_norm(self.depth_router(x))
             weights, selected_tokens = torch.topk(
                 token_logits, capacity, dim=1, sorted=False)
 
@@ -227,10 +243,13 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.region_router = Router(params.dim + 2, params.n_regions + 1)
+        self.preprocessing_block = TransformerBlock(98, params)
+        self.halt_router = HaltRouter(params.dim, params.max_seq_len)
+        self.region_router = Router(params.dim + 17, params.n_regions)
         self.regions = torch.nn.ModuleList()
         for region_id in range(params.n_regions):
             self.regions.append(Region(region_id, self.region_depth, params))
+        self.postprocessing_block = TransformerBlock(99, params)
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
@@ -253,8 +272,8 @@ class Transformer(nn.Module):
 
         # Initialize attributes for block usage
         # theoretically there should be no max block usage, but using this for now
-        self.max_region_usage = self.n_regions * 2
-        self.region_penalty = 0.02
+        self.max_region_usage = self.n_regions * 4
+        self.region_penalty = 0.05
 
         # Initialize attribute for MoD capacity
         self.capacity = 0.125
@@ -278,25 +297,44 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
 
+        h = self.preprocessing_block(h)
+
+        unhalted_prob = 1.0
+        p = []
         regions_used = 0
-        last_region = -1.0
+        last_regions = [-1] * self.max_region_usage
 
         while regions_used < self.max_region_usage:
-            # get the region to route to by the max of the router
-            logits_per_position = self.region_router(
-                h, regions_used / self.n_regions, last_region / self.n_regions)
-            averaged_logits = torch.mean(logits_per_position, dim=1)
-            probabilities = gumbel_softmax(
-                averaged_logits, temperature=0.8, hard=False)
-            region = torch.argmax(probabilities, dim=-1).item()
+            lambda_n = torch.sigmoid(self.halt_router(h))
+            p_n = unhalted_prob * lambda_n
+            unhalted_prob = unhalted_prob * (1 - lambda_n)
+            halt = dist.Bernoulli(lambda_n).sample().item()
+            p.append(p_n)
 
-            if region == self.n_regions:
+            if halt == 1.0:
                 break
 
-            last_region = region
+            # get the region to route to by the max of the router
+            logits_per_position = self.region_router(
+                h, regions_used, last_regions)
+            averaged_logits = torch.mean(logits_per_position, dim=1)
+            probabilities = gumbel_softmax(
+                averaged_logits, temperature=0.1, hard=False)
+            region = torch.argmax(probabilities, dim=-1).item()
+
+            try:
+                # Find the first occurrence of -1 and replace it
+                index = last_regions.index(-1)
+                last_regions[index] = region
+            except ValueError:
+                # No -1 found in the array, so remove the first number and append the new one
+                last_regions.pop(0)
+                last_regions.append(region)
+
             regions_used += 1
             h = self.regions[region](h)
 
+        h = self.postprocessing_block(h)
         h = self.norm(h)
 
         if targets is not None:
