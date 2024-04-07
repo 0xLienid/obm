@@ -139,12 +139,12 @@ for epoch in range(epochs):
                 eval_base_loss = model.last_base_loss
                 eval_total_loss = model.last_total_loss
 
-                if i == 0:
-                    gen_outputs = model.generate(
-                        eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
-                    print(
-                        f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
-                    del gen_outputs
+                # if i == 0:
+                #     gen_outputs = model.generate(
+                #         eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
+                #     print(
+                #         f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
+                #     del gen_outputs
 
                 del eval_inputs, eval_targets
 

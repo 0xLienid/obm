@@ -245,7 +245,7 @@ class Transformer(nn.Module):
         self.dropout = nn.Dropout(params.dropout)
         self.preprocessing_block = TransformerBlock(98, params)
         self.halt_router = HaltRouter(params.dim, params.max_seq_len)
-        self.region_router = Router(params.dim + 17, params.n_regions)
+        self.region_router = Router(params.dim + 33, params.n_regions)
         self.regions = torch.nn.ModuleList()
         for region_id in range(params.n_regions):
             self.regions.append(Region(region_id, self.region_depth, params))
