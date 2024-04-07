@@ -1,3 +1,4 @@
+import torch.nn as nn
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -25,25 +26,53 @@ class ModelArgs:
     dropout: float = 0.0
 
 
-class Router(torch.nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+class RegularizationLoss(nn.Module):
+    def __init__(self, lambda_p: float, max_steps: int):
         super().__init__()
-        self.w1 = nn.Linear(input_dim, input_dim * 2, bias=False)
-        self.w2 = nn.Linear(input_dim * 2, output_dim, bias=False)
-        self.norm = RMSNorm(output_dim, eps=1e-5)
+        self.lambda_p = lambda_p
+        self.max_steps = max_steps
 
-    def forward(self, x, blocks_used: Optional[int] = 0, last_blocks: Optional = None):
+        not_halted = 1.0
+        p_g_list = []
+        for _ in range(self.max_steps):
+            p_g_list.append(not_halted * self.lambda_p)
+            not_halted *= (1 - self.lambda_p)
+        p_g = torch.tensor(p_g_list, dtype=torch.float32)
+        self.register_buffer('p_g', p_g)
+
+    def forward(self, p):
+        p = p.transpose(1, 0)
+        p_g = self.p_g[None, :p.shape[1]].expand_as(p)
+        return F.kl_div(torch.log(p), p_g, reduction='batchmean')
+
+
+class RegionRouter(nn.Module):
+    def __init__(self, input_dim: int, n_regions: int, seq_len: int, max_regions: int):
+        super().__init__()
+        self.seq_len = seq_len
+        self.n_regions = n_regions
+
+        self.w1 = nn.Linear(input_dim + max_regions + 1, n_regions, bias=False)
+        self.w2 = nn.Linear(seq_len * n_regions, n_regions, bias=False)
+        self.norm = RMSNorm(n_regions, eps=1e-5)
+
+    def forward(self, x, regions_used, last_regions):
         _, n, _ = x.shape
+        if n < self.seq_len:
+            pad_size = self.seq_len - n
+            x = F.pad(x, (0, 0, 0, pad_size), "constant", 0)
 
-        # Make blocks_used and last_blocks the last two elements in each embedding dimension
-        if blocks_used is not None and last_blocks is not None:
-            blocks_used_tensor = torch.full(
-                (1, n, 1), blocks_used, dtype=x.dtype, device=x.device)
-            last_blocks_tensor = torch.tensor(
-                last_blocks, dtype=x.dtype, device=x.device).repeat(n, 1).unsqueeze(0)
-            x = torch.cat((x, blocks_used_tensor, last_blocks_tensor), dim=2)
+        regions_used_tensor = torch.tensor(
+            [[regions_used]], dtype=x.dtype, device=x.device).repeat(1, self.seq_len, 1)
+        last_regions_tensor = torch.tensor(
+            [last_regions], dtype=x.dtype, device=x.device).repeat(1, self.seq_len, 1)
+        x = torch.cat((x, regions_used_tensor, last_regions_tensor), -1)
 
-        return self.norm(self.w2(F.silu(self.w1(x))))
+        x = self.w1(x)
+        x = x.view(-1, self.seq_len * self.n_regions)
+        x = self.w2(x)
+        x = self.norm(x)
+        return x
 
 
 class HaltRouter(nn.Module):
@@ -54,6 +83,11 @@ class HaltRouter(nn.Module):
         self.w2 = nn.Linear(seq_len, 1, bias=False)
 
     def forward(self, x):
+        _, n, _ = x.shape
+        if n < self.seq_len:
+            pad_size = self.seq_len - n
+            x = F.pad(x, (0, 0, 0, pad_size), "constant", 0)
+
         x = self.w1(x)
         x = x.view(-1, self.seq_len)
         x = self.w2(x)
@@ -242,16 +276,21 @@ class Transformer(nn.Module):
         self.region_depth = params.n_layers // params.n_regions
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.pos_embeddings = nn.Embedding(params.max_seq_len, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.preprocessing_block = TransformerBlock(98, params)
         self.halt_router = HaltRouter(params.dim, params.max_seq_len)
-        self.region_router = Router(params.dim + 33, params.n_regions)
+        self.region_router = RegionRouter(
+            params.dim, params.n_regions, params.max_seq_len, self.n_regions * 4)
         self.regions = torch.nn.ModuleList()
         for region_id in range(params.n_regions):
             self.regions.append(Region(region_id, self.region_depth, params))
         self.postprocessing_block = TransformerBlock(99, params)
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+
+        self.reg_loss_module = RegularizationLoss(
+            1 / self.n_regions, self.n_regions * 4)
 
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
@@ -286,6 +325,15 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def get_halt_router_param_count(self):
+        return sum(p.numel() for p in self.halt_router.parameters())
+
+    def get_region_router_param_count(self):
+        return sum(p.numel() for p in self.region_router.parameters())
+
+    def get_per_block_param_count(self):
+        return sum(p.numel() for p in self.regions[0].parameters())
+
     # currently only works for batch size 1
     def forward(
         self,
@@ -295,7 +343,9 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         _, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        h = self.dropout(h)
+        pos_emb = self.pos_embeddings(torch.arange(
+            0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
+        h = self.dropout(h + pos_emb)
 
         h = self.preprocessing_block(h)
 
@@ -315,11 +365,10 @@ class Transformer(nn.Module):
                 break
 
             # get the region to route to by the max of the router
-            logits_per_position = self.region_router(
+            logits = self.region_router(
                 h, regions_used, last_regions)
-            averaged_logits = torch.mean(logits_per_position, dim=1)
             probabilities = gumbel_softmax(
-                averaged_logits, temperature=0.1, hard=False)
+                logits, temperature=0.1, hard=False)
             region = torch.argmax(probabilities, dim=-1).item()
 
             try:
@@ -347,8 +396,8 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + self.region_penalty * \
-                (((regions_used - self.n_regions) / self.n_regions) ** 2)
+            self.last_total_loss = self.last_base_loss + \
+                self.reg_loss_module(p)
             self.last_regions_used = regions_used
         else:
             # inference-time mini-optimization: only forward the output on the very last position

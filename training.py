@@ -34,7 +34,7 @@ model_args = ModelArgs(
     n_regions=8,
     n_heads=32,
     vocab_size=50257,
-    hidden_dim=1024,
+    hidden_dim=2048,
     multiple_of=256,
     norm_eps=1e-5,
     max_seq_len=512,
@@ -46,8 +46,11 @@ os.makedirs(f"runs/{model_name}/{run_id}", exist_ok=True)
 
 # Create model
 model = Transformer(model_args)
-total_params = count_parameters(model)
-print(f"Total Parameters: {total_params}")
+halt_params = model.get_halt_router_param_count()
+region_params = model.get_region_router_param_count()
+block_params = model.get_per_block_param_count()
+print(
+    f"Halt Router Params: {halt_params}, Region Router Params: {region_params}, Per-Block Params: {block_params}")
 model.to(device)
 
 # Create tokenizer
@@ -139,12 +142,12 @@ for epoch in range(epochs):
                 eval_base_loss = model.last_base_loss
                 eval_total_loss = model.last_total_loss
 
-                # if i == 0:
-                #     gen_outputs = model.generate(
-                #         eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
-                #     print(
-                #         f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
-                #     del gen_outputs
+                if i == 0:
+                    gen_outputs = model.generate(
+                        eval_inputs[0][:10].unsqueeze(0), max_new_tokens=20)
+                    print(
+                        f"Generated: {tokenizer.decode(gen_outputs[0].tolist())}")
+                    del gen_outputs
 
                 del eval_inputs, eval_targets
 
