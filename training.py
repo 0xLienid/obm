@@ -31,7 +31,7 @@ dtype = "bfloat16"
 model_args = ModelArgs(
     dim=512,
     n_layers=32,
-    n_regions=8,
+    forward_width=4,
     n_heads=32,
     vocab_size=50257,
     hidden_dim=2048,
@@ -47,10 +47,11 @@ os.makedirs(f"runs/{model_name}/{run_id}", exist_ok=True)
 # Create model
 model = Transformer(model_args)
 halt_params = model.get_halt_router_param_count()
-region_params = model.get_region_router_param_count()
+block_router_params = model.get_block_router_param_count()
+token_block_router_params = model.get_token_block_router_param_count()
 block_params = model.get_per_block_param_count()
 print(
-    f"Halt Router Params: {halt_params}, Region Router Params: {region_params}, Per-Block Params: {block_params}")
+    f"Halt Router Params: {halt_params}, Block Router Params: {block_router_params}, Per-Block Params: {block_params}")
 model.to(device)
 
 # Create tokenizer
@@ -73,11 +74,13 @@ print("wandb run initialized")
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=lr, weight_decay=weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, lr_decay_steps, min_lr)
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#     optimizer, lr_decay_steps, min_lr)
 print("optimizer and scheduler initialized")
 
 # Training loop
+start_time = dt.datetime.now()
+tokens_trained = 0
 global_step = 0
 
 for epoch in range(epochs):
@@ -85,6 +88,8 @@ for epoch in range(epochs):
     optimizer.zero_grad(set_to_none=True)
 
     for batch in train_batches:
+        tokens_trained += batch["inputs"].shape[1]
+
         inputs = batch["inputs"].to(device)
         targets = batch["targets"].to(device)
         attn_masks = batch["attn_masks"].to(device)
@@ -92,8 +97,7 @@ for epoch in range(epochs):
         model(inputs, targets=targets, attn_mask=attn_masks)
         base_loss = model.last_base_loss
         total_loss = model.last_total_loss
-        blocks_used = model.last_regions_used
-        regions_used = model.region_usage
+        blocks_used = model.last_blocks_used
 
         del inputs, targets
 
@@ -104,7 +108,7 @@ for epoch in range(epochs):
         if (global_step + 1) % accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            # scheduler.step()
 
             total_norm = 0
             for p in model.parameters():
@@ -120,14 +124,14 @@ for epoch in range(epochs):
             optimizer.zero_grad(set_to_none=True)
 
             print(
-                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}, Blocks used: {blocks_used}, Region usage: {regions_used}")
+                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}, Blocks used: {blocks_used}")
             try:
                 run.log({"base_loss": base_loss.item(), "total_loss": total_loss.item(
                 ) * accumulation_steps, "grad_norm": total_norm, "blocks_used": blocks_used})
             except:
                 print(f"Failed to push training data to wandb")
 
-        del total_loss, base_loss, blocks_used, regions_used
+        del total_loss, base_loss, blocks_used
 
         if (global_step + 1) % eval_steps == 0:
             model.eval()
@@ -177,6 +181,10 @@ for epoch in range(epochs):
     print(f"Epoch: {epoch + 1}, Loss: {epoch_loss}")
 
     epoch += 1
+
+end_time = dt.datetime.now()
+print(
+    f"Training complete, took {end_time - start_time}, trained {tokens_trained} tokens")
 
 # Save model
 torch.save(model.state_dict(), f"runs/{model_name}/{run_id}/model.pt")
