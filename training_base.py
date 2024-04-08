@@ -31,7 +31,6 @@ dtype = "bfloat16"
 model_args = ModelArgs(
     dim=512,
     n_layers=32,
-    n_regions=8,
     n_heads=32,
     vocab_size=50257,
     hidden_dim=2048,
@@ -46,11 +45,9 @@ os.makedirs(f"runs/{model_name}/{run_id}", exist_ok=True)
 
 # Create model
 model = Transformer(model_args)
-halt_params = model.get_halt_router_param_count()
-region_params = model.get_region_router_param_count()
 block_params = model.get_per_block_param_count()
 print(
-    f"Halt Router Params: {halt_params}, Region Router Params: {region_params}, Per-Block Params: {block_params}")
+    f"Per-Block Params: {block_params}")
 model.to(device)
 
 # Create tokenizer
@@ -91,15 +88,12 @@ for epoch in range(epochs):
 
         model(inputs, targets=targets, attn_mask=attn_masks)
         base_loss = model.last_base_loss
-        total_loss = model.last_total_loss
-        blocks_used = model.last_regions_used
-        regions_used = model.region_usage
 
         del inputs, targets
 
         total_loss = total_loss / accumulation_steps
         scaler.scale(total_loss).backward()
-        epoch_loss += total_loss.item()
+        epoch_loss += total_loss.item() * accumulation_steps
 
         if (global_step + 1) % accumulation_steps == 0:
             scaler.step(optimizer)
@@ -120,19 +114,18 @@ for epoch in range(epochs):
             optimizer.zero_grad(set_to_none=True)
 
             print(
-                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}, Blocks used: {blocks_used}, Region usage: {regions_used}")
+                f"Step: {global_step + 1}, Loss: {total_loss.item() * accumulation_steps}")
             try:
-                run.log({"base_loss": base_loss.item(), "total_loss": total_loss.item(
-                ) * accumulation_steps, "grad_norm": total_norm, "blocks_used": blocks_used})
+                run.log({"base_loss": base_loss.item(), "total_loss": base_loss.item(
+                ), "grad_norm": total_norm, "blocks_used": 8})
             except:
                 print(f"Failed to push training data to wandb")
 
-        del total_loss, base_loss, blocks_used, regions_used
+        del total_loss, base_loss
 
         if (global_step + 1) % eval_steps == 0:
             model.eval()
             eval_run_base_loss = 0.0
-            eval_run_total_loss = 0.0
             for i, eval_batch in enumerate(eval_batches):
                 eval_inputs = eval_batch["inputs"].to(device)
                 eval_targets = eval_batch["targets"].to(device)
@@ -141,7 +134,6 @@ for epoch in range(epochs):
                 model(eval_inputs, targets=eval_targets,
                       attn_mask=eval_attn_masks)
                 eval_base_loss = model.last_base_loss
-                eval_total_loss = model.last_total_loss
 
                 if i == 0:
                     gen_outputs = model.generate(
@@ -153,15 +145,13 @@ for epoch in range(epochs):
                 del eval_inputs, eval_targets
 
                 eval_run_base_loss += eval_base_loss.item()
-                eval_run_total_loss += eval_total_loss.item()
-                del eval_base_loss, eval_total_loss
+                del eval_base_loss
 
             eval_run_base_loss /= len(eval_batches)
-            eval_run_total_loss /= len(eval_batches)
-            print(f"Step: {global_step + 1}, Eval Loss: {eval_run_total_loss}")
+            print(f"Step: {global_step + 1}, Eval Loss: {eval_run_base_loss}")
             try:
                 run.log({"eval_base_loss": eval_run_base_loss,
-                        "eval_total_loss": eval_run_total_loss})
+                        "eval_total_loss": eval_run_base_loss})
             except:
                 print(f"Failed to push eval data to wandb")
             model.train()

@@ -10,6 +10,8 @@ import torch.distributions as dist
 from torch import nn
 
 
+# TODO: ADD JAMBA
+
 @dataclass
 class ModelArgs:
     # default hyperparameters for the Llama 7B model
@@ -205,6 +207,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
+        x_token,
         capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
@@ -229,7 +232,7 @@ class TransformerBlock(nn.Module):
 
         h = x_input + \
             self.attention.forward(
-                self.attention_norm(x_input))
+                self.attention_norm(x_input * x_token))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
 
         if capacity != 1.0:
@@ -259,10 +262,10 @@ class Region(nn.Module):
         # Initialize attribute for MoD capacity
         self.capacity = 0.125
 
-    def forward(self, x):
+    def forward(self, x, x_token):
         for i, block in enumerate(self.blocks):
             block_capacity = 1.0 if i % 2 == 0 else self.capacity
-            x = block(x, block_capacity)
+            x = block(x, x_token, block_capacity)
         return x
 
 
@@ -349,8 +352,9 @@ class Transformer(nn.Module):
         pos_emb = self.pos_embeddings(torch.arange(
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
+        x_token = h
 
-        h = self.preprocessing_block(h)
+        h = self.preprocessing_block(h, x_token)
 
         unhalted_prob = 1.0
         p = []
@@ -384,9 +388,9 @@ class Transformer(nn.Module):
                 last_regions.append(region)
 
             regions_used += 1
-            h = self.regions[region](h)
+            h = self.regions[region](h, x_token)
 
-        h = self.postprocessing_block(h)
+        h = self.postprocessing_block(h, x_token)
         h = self.norm(h)
 
         if targets is not None:

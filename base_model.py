@@ -15,7 +15,6 @@ class ModelArgs:
     # default hyperparameters for the Llama 7B model
     dim: int = 4096
     n_layers: int = 32
-    n_regions: int = 8
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = 32000
@@ -24,76 +23,6 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
-
-
-class RegularizationLoss(nn.Module):
-    def __init__(self, lambda_p: float, max_steps: int):
-        super().__init__()
-        self.lambda_p = lambda_p
-        self.max_steps = max_steps
-
-        not_halted = 1.0
-        p_g_list = []
-        for _ in range(self.max_steps):
-            p_g_list.append(not_halted * self.lambda_p)
-            not_halted *= (1 - self.lambda_p)
-        p_g = torch.tensor(p_g_list, dtype=torch.float32)
-        self.register_buffer('p_g', p_g)
-
-    def forward(self, p):
-        p = p.transpose(1, 0)
-        p_g = self.p_g[None, :p.shape[1]].expand_as(p).to("cuda")
-        result = F.kl_div(torch.log(p + 1e-9), p_g, reduction='batchmean')
-
-        return result
-
-
-class RegionRouter(nn.Module):
-    def __init__(self, input_dim: int, n_regions: int, seq_len: int, max_regions: int):
-        super().__init__()
-        self.seq_len = seq_len
-        self.n_regions = n_regions
-
-        self.w1 = nn.Linear(input_dim + max_regions + 1, n_regions, bias=False)
-        self.w2 = nn.Linear(seq_len * n_regions, n_regions, bias=False)
-        self.norm = RMSNorm(n_regions, eps=1e-5)
-
-    def forward(self, x, regions_used, last_regions):
-        _, n, _ = x.shape
-        if n < self.seq_len:
-            pad_size = self.seq_len - n
-            x = F.pad(x, (0, 0, 0, pad_size), "constant", 0)
-
-        regions_used_tensor = torch.tensor(
-            [[regions_used]], dtype=x.dtype, device=x.device).repeat(1, self.seq_len, 1)
-        last_regions_tensor = torch.tensor(
-            [last_regions], dtype=x.dtype, device=x.device).repeat(1, self.seq_len, 1)
-        x = torch.cat((x, regions_used_tensor, last_regions_tensor), -1)
-
-        x = self.w1(x)
-        x = x.view(-1, self.seq_len * self.n_regions)
-        x = self.w2(x)
-        x = self.norm(x)
-        return x
-
-
-class HaltRouter(nn.Module):
-    def __init__(self, input_dim: int, seq_len: int):
-        super().__init__()
-        self.seq_len = seq_len
-        self.w1 = nn.Linear(input_dim, 1, bias=False)
-        self.w2 = nn.Linear(seq_len, 1, bias=False)
-
-    def forward(self, x):
-        _, n, _ = x.shape
-        if n < self.seq_len:
-            pad_size = self.seq_len - n
-            x = F.pad(x, (0, 0, 0, pad_size), "constant", 0)
-
-        x = self.w1(x)
-        x = x.view(-1, self.seq_len)
-        x = self.w2(x)
-        return x
 
 
 class RMSNorm(torch.nn.Module):
@@ -189,8 +118,6 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.depth_router = nn.Linear(args.dim, 1, bias=False)
-        self.dr_norm = RMSNorm(1, eps=args.norm_eps)
         self.attention = CausalSelfAttention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -205,65 +132,13 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
-        x_input = None
-        indices_expanded = None
-        weights = None
-
-        if capacity == 1.0:
-            x_input = x
-        else:
-            _, n, m = x.shape
-
-            capacity = max(1, int(capacity * n))
-            token_logits = self.dr_norm(self.depth_router(x))
-            weights, selected_tokens = torch.topk(
-                token_logits, capacity, dim=1, sorted=False)
-
-            selected_tokens, index = torch.sort(selected_tokens, dim=1)
-            weights = torch.gather(weights, dim=1, index=index)
-            indices_expanded = selected_tokens.expand(-1, -1, m)
-            x_input = torch.gather(x, 1, indices_expanded)
-
-        h = x_input + \
+        h = x + \
             self.attention.forward(
-                self.attention_norm(x_input))
+                self.attention_norm(x))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
-
-        if capacity != 1.0:
-            x = torch.scatter_add(
-                x,
-                dim=1,
-                index=indices_expanded,
-                src=h * weights,
-            )
-            return x
-
         return out
-
-
-class Region(nn.Module):
-    def __init__(self, id: int, depth: int, params: ModelArgs):
-        super().__init__()
-        self.id = id
-        self.global_id = id * depth
-        self.depth = depth
-        self.params = params
-        self.blocks = torch.nn.ModuleList()
-        for block_id in range(depth):
-            self.blocks.append(TransformerBlock(
-                self.global_id + block_id, params))
-
-        # Initialize attribute for MoD capacity
-        self.capacity = 0.125
-
-    def forward(self, x):
-        for i, block in enumerate(self.blocks):
-            block_capacity = 1.0 if i % 2 == 0 else self.capacity
-            x = block(x, block_capacity)
-        return x
 
 
 class Transformer(nn.Module):
@@ -274,25 +149,15 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-        self.n_regions = params.n_regions
-        self.region_depth = params.n_layers // params.n_regions
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.pos_embeddings = nn.Embedding(params.max_seq_len, params.dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.preprocessing_block = TransformerBlock(98, params)
-        self.halt_router = HaltRouter(params.dim, params.max_seq_len)
-        self.region_router = RegionRouter(
-            params.dim, params.n_regions, params.max_seq_len, self.n_regions * 4)
-        self.regions = torch.nn.ModuleList()
-        for region_id in range(params.n_regions):
-            self.regions.append(Region(region_id, self.region_depth, params))
-        self.postprocessing_block = TransformerBlock(99, params)
+        self.blocks = torch.nn.ModuleList()
+        for i in range(params.n_layers):
+            self.blocks.append(TransformerBlock(i, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-
-        self.reg_loss_module = RegularizationLoss(
-            0.2, self.n_regions * 4)
 
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
@@ -308,17 +173,6 @@ class Transformer(nn.Module):
 
         # Initialize attributes for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_base_loss = None
-        self.last_total_loss = None
-        self.last_regions_used = None
-        self.region_usage = None
-
-        # Initialize attributes for block usage
-        # theoretically there should be no max block usage, but using this for now
-        self.max_region_usage = self.n_regions * 4
-        self.region_penalty = 0.5
-
-        # Initialize attribute for MoD capacity
-        self.capacity = 0.125
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -327,12 +181,6 @@ class Transformer(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def get_halt_router_param_count(self):
-        return sum(p.numel() for p in self.halt_router.parameters())
-
-    def get_region_router_param_count(self):
-        return sum(p.numel() for p in self.region_router.parameters())
 
     def get_per_block_param_count(self):
         return sum(p.numel() for p in self.regions[0].parameters())
@@ -350,43 +198,9 @@ class Transformer(nn.Module):
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
 
-        h = self.preprocessing_block(h)
+        for block in self.blocks:
+            h = block(h)
 
-        unhalted_prob = 1.0
-        p = []
-        regions_used = 0
-        last_regions = [-1] * self.max_region_usage
-
-        while regions_used < self.max_region_usage:
-            lambda_n = torch.sigmoid(self.halt_router(h))
-            p_n = unhalted_prob * lambda_n
-            unhalted_prob = unhalted_prob * (1 - lambda_n)
-            halt = dist.Bernoulli(lambda_n - 1.1).sample().item()
-            p.append(p_n)
-
-            if halt == 1.0:
-                break
-
-            # get the region to route to by the max of the router
-            logits = self.region_router(
-                h, regions_used, last_regions)
-            probabilities = gumbel_softmax(
-                logits, temperature=0.1, hard=False)
-            region = torch.multinomial(probabilities.squeeze(), 1).item()
-
-            try:
-                # Find the first occurrence of -1 and replace it
-                index = last_regions.index(-1)
-                last_regions[index] = region
-            except ValueError:
-                # No -1 found in the array, so remove the first number and append the new one
-                last_regions.pop(0)
-                last_regions.append(region)
-
-            regions_used += 1
-            h = self.regions[region](h)
-
-        h = self.postprocessing_block(h)
         h = self.norm(h)
 
         if targets is not None:
@@ -399,20 +213,11 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + \
-                self.reg_loss_module(torch.tensor([p], device="cuda")) + self.region_penalty * (
-                    ((regions_used - self.n_regions) / self.n_regions) ** 2)
-            self.last_regions_used = regions_used
-            self.region_usage = dict((region, self.last_regions_used.count(
-                region)) for region in set(self.last_regions_used))
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             # note: using list [-1] to preserve the time dim
             logits = self.output(h[:, [-1], :])
             self.last_base_loss = None
-            self.last_total_loss = None
-            self.last_regions_used = None
-            self.region_usage = None
 
         return logits
 
