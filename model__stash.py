@@ -271,11 +271,12 @@ class Transformer(nn.Module):
         self.blocks = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.blocks.append(TransformerBlock(layer_id, params))
+        self.postprocessing_block = TransformerBlock(99, params)
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.reg_loss_module = RegularizationLoss(
-            0.25, self.n_layers * 4)
+            2 / self.n_layers, self.n_layers * 4)
 
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
@@ -351,8 +352,8 @@ class Transformer(nn.Module):
             if last_block_set is not None:
                 # get embeddings for the last block set and add them to each token in the sequence
                 block_emb = self.block_embeddings(torch.tensor(
-                    last_block_set, dtype=h.dtype, device=h.device))
-                block_emb = block_emb.unsqueeze(1).expand(-1, seqlen, -1)
+                    last_block_set, dtype=torch.int, device=h.device)).unsqueeze(1)
+                block_emb = block_emb.sum(dim=0).unsqueeze(0)
                 h = h + block_emb
 
             if blocks_used == self.max_block_usage:
@@ -415,6 +416,7 @@ class Transformer(nn.Module):
                 print(f"Outputs: {block_outputs}")
                 raise Exception("break")
 
+        h = self.postprocessing_block(h)
         h = self.norm(h)
 
         if targets is not None:
