@@ -199,39 +199,29 @@ class TransformerBlock(nn.Module):
         capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
-        x_input = None
-        indices_expanded = None
-        weights = None
+        _, n, m = x.shape
 
-        if capacity == 1.0:
-            x_input = x
-        else:
-            _, n, m = x.shape
+        capacity = max(1, int(capacity * n))
+        token_logits = self.dr_norm(self.depth_router(x))
+        weights, selected_tokens = torch.topk(
+            token_logits, capacity, dim=1, sorted=False)
 
-            capacity = max(1, int(capacity * n))
-            token_logits = self.dr_norm(self.depth_router(x))
-            weights, selected_tokens = torch.topk(
-                token_logits, capacity, dim=1, sorted=False)
-
-            selected_tokens, index = torch.sort(selected_tokens, dim=1)
-            weights = torch.gather(weights, dim=1, index=index)
-            indices_expanded = selected_tokens.expand(-1, -1, m)
-            x_input = torch.gather(x, 1, indices_expanded)
+        selected_tokens, index = torch.sort(selected_tokens, dim=1)
+        weights = torch.gather(weights, dim=1, index=index)
+        indices_expanded = selected_tokens.expand(-1, -1, m)
+        x_input = torch.gather(x, 1, indices_expanded)
 
         h = x_input + \
             self.attention.forward(
                 self.attention_norm(x_input))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
 
-        if capacity != 1.0:
-            x = torch.scatter_add(
-                x,
-                dim=1,
-                index=indices_expanded,
-                src=h * weights,
-            )
-            return x
-
+        out = torch.scatter_add(
+            x,
+            dim=1,
+            index=indices_expanded,
+            src=out * weights,
+        )
         return out
 
 
@@ -281,7 +271,6 @@ class Transformer(nn.Module):
         self.blocks = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.blocks.append(TransformerBlock(layer_id, params))
-        self.postprocessing_block = TransformerBlock(99, params)
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
@@ -350,13 +339,15 @@ class Transformer(nn.Module):
 
         i = 0
         unhalted_prob = 1.0
+        halted = torch.tensor(0.0, dtype=h.dtype, device=h.device)
         p = []
         blocks_used = 0
+        blocks_used_at_halt = 0
         last_block_set = None
         last_blocks = [[-1 for _ in range(self.forward_width)]
                        for _ in range(self.max_block_usage)]
 
-        while blocks_used < self.max_block_usage:
+        while blocks_used <= self.max_block_usage:
             if last_block_set is not None:
                 # get embeddings for the last block set and add them to each token in the sequence
                 block_emb = self.block_embeddings(torch.tensor(
@@ -364,15 +355,19 @@ class Transformer(nn.Module):
                 block_emb = block_emb.unsqueeze(1).expand(-1, seqlen, -1)
                 h = h + block_emb
 
-            lambda_n, _ = torch.sigmoid(self.halt_router(
-                h)).squeeze(-1).min(dim=-1)
+            if blocks_used == self.max_block_usage:
+                lambda_n = torch.tensor(1.0, dtype=h.dtype, device=h.device)
+            else:
+                lambda_n, _ = torch.sigmoid(self.halt_router(
+                    h)).squeeze(-1).min(dim=-1)
+
             p_n = unhalted_prob * lambda_n
             unhalted_prob = unhalted_prob * (1 - lambda_n)
+            halt = dist.Bernoulli(lambda_n).sample() * (1 - halted)
             p.append(p_n)
 
-            halt = dist.Bernoulli(lambda_n).sample().item()
-            if halt == 1.0:
-                break
+            if halt.item() == 1.0:
+                blocks_used_at_halt = blocks_used
 
             blocks_used += self.forward_width
 
@@ -382,12 +377,6 @@ class Transformer(nn.Module):
                 logits, temperature=1.0, hard=False)  # (1, n_layers)
             _, topk_indices = probabilities.topk(
                 self.forward_width, dim=-1, sorted=False)
-            # router_scores = F.normalize(topk_router_probabilities, p=1, dim=-1)
-            # router_scores_expanded = router_scores.unsqueeze(-1).unsqueeze(-1)
-
-            # region_outputs = torch.stack([self.regions[region](h) for region in topk_indices.flatten()], dim=1)
-            # weighted_region_outputs = region_outputs * router_scores_expanded
-            # h = weighted_region_outputs.sum(dim=1)
 
             token_block_logits = self.token_block_router(
                 h)  # (1, n, n_layers)
@@ -403,17 +392,13 @@ class Transformer(nn.Module):
             block_outputs = torch.stack([self.blocks[block](
                 h, capacity) for block in topk_indices.flatten()], dim=1)  # (1, topk, n, m)
             block_outputs = block_outputs.transpose(1, 2)
-            h = torch.einsum(
+            block_outputs = torch.einsum(
                 'bte,bteo->bto', topk_token_block_probabilities, block_outputs)
+            h = h * (1 - halt) + block_outputs * halt
 
             i += 1
-
-            has_nan = torch.isnan(h).any().item()
-            if has_nan:
-                print(f"Probs: {topk_token_block_probabilities}")
-                print(f"Outputs: {block_outputs}")
-                raise Exception("break")
-
+            halted = halted + halt
+            last_block_set = topk_indices.flatten().tolist()
             replaced = False
             for i, row in enumerate(last_blocks):
                 if row == [-1] * self.forward_width:
@@ -424,7 +409,12 @@ class Transformer(nn.Module):
                 last_blocks.pop(0)
                 last_blocks.append(topk_indices.flatten().tolist())
 
-        h = self.postprocessing_block(h)
+            has_nan = torch.isnan(h).any().item()
+            if has_nan:
+                print(f"Probs: {topk_token_block_probabilities}")
+                print(f"Outputs: {block_outputs}")
+                raise Exception("break")
+
         h = self.norm(h)
 
         if targets is not None:
@@ -439,7 +429,7 @@ class Transformer(nn.Module):
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
             self.last_total_loss = self.last_base_loss + \
                 self.reg_loss_module(torch.tensor([p], device="cuda"))
-            self.last_blocks_used = blocks_used
+            self.last_blocks_used = blocks_used_at_halt
         else:
             # inference-time mini-optimization: only forward the output on the very last position
             # note: using list [-1] to preserve the time dim
