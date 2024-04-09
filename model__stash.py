@@ -347,8 +347,8 @@ class Transformer(nn.Module):
             if last_block_set is not None:
                 # get embeddings for the last block set and add them to each token in the sequence
                 block_emb = self.block_embeddings(torch.tensor(
-                    last_block_set, dtype=h.dtype, device=h.device))
-                block_emb = block_emb.unsqueeze(1).expand(-1, seqlen, -1)
+                    last_block_set, dtype=torch.int, device=h.device)).unsqueeze(1)
+                block_emb = block_emb.sum(dim=0).unsqueeze(0)
                 h = h + block_emb
 
             halt = 0.0
