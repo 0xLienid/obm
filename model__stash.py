@@ -274,9 +274,6 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        self.reg_loss_module = RegularizationLoss(
-            0.25, self.n_layers * 4)
-
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
         self.tok_embeddings.weight = self.output.weight
@@ -338,9 +335,8 @@ class Transformer(nn.Module):
         h = self.preprocessing_block(h)
 
         i = 0
-        unhalted_prob = 1.0
         halted = torch.tensor(0.0, dtype=h.dtype, device=h.device)
-        p = []
+        last_top_logit = None
         blocks_used = 0
         blocks_used_at_halt = 0
         last_block_set = None
@@ -355,16 +351,10 @@ class Transformer(nn.Module):
                 block_emb = block_emb.unsqueeze(1).expand(-1, seqlen, -1)
                 h = h + block_emb
 
-            if blocks_used == self.max_block_usage:
-                lambda_n = torch.tensor(1.0, dtype=h.dtype, device=h.device)
-            else:
-                lambda_n, _ = torch.sigmoid(self.halt_router(
-                    h)).squeeze(-1).min(dim=-1)
-
-            p_n = unhalted_prob * lambda_n
-            unhalted_prob = unhalted_prob * (1 - lambda_n)
-            halt = dist.Bernoulli(lambda_n).sample() * (1 - halted)
-            p.append(p_n)
+            halt = 0.0
+            with torch.no_grad():
+                if self.output(h)[:, -1, :].argmax().item() == last_top_logit:
+                    halt = 1.0
 
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
@@ -427,8 +417,9 @@ class Transformer(nn.Module):
 
             self.last_base_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets, ignore_index=-100)
-            self.last_total_loss = self.last_base_loss + \
-                self.reg_loss_module(torch.tensor([p], device="cuda"))
+            self.last_total_loss = self.last_base_loss + self.block_penalty * \
+                torch.log(torch.tensor(blocks_used_at_halt,
+                          dtype=h.device, device=h.device) + 1.0)
             self.last_blocks_used = blocks_used_at_halt
         else:
             # inference-time mini-optimization: only forward the output on the very last position
