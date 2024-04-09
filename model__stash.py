@@ -286,7 +286,7 @@ class Transformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.reg_loss_module = RegularizationLoss(
-            0.3, self.n_layers * 4)
+            0.25, self.n_layers * 4)
 
         # share the unembedding parameters with the embedding parameters
         # https://paperswithcode.com/method/weight-tying
@@ -325,7 +325,7 @@ class Transformer(nn.Module):
         return sum(p.numel() for p in self.halt_router.parameters())
 
     def get_block_router_param_count(self):
-        return sum(p.numel() for p in self.block_router.parameters())
+        return sum(p.numel() for p in self.blocks_router.parameters())
 
     def get_token_block_router_param_count(self):
         return sum(p.numel() for p in self.token_block_router.parameters())
@@ -348,6 +348,7 @@ class Transformer(nn.Module):
 
         h = self.preprocessing_block(h)
 
+        i = 0
         unhalted_prob = 1.0
         p = []
         blocks_used = 0
@@ -363,21 +364,14 @@ class Transformer(nn.Module):
                 block_emb = block_emb.unsqueeze(1).expand(-1, seqlen, -1)
                 h = h + block_emb
 
-            lambda_n = torch.sigmoid(self.halt_router(
-                h)).min(dim=-1)
-
-            has_nan = torch.isnan(lambda_n).any().item()
-            if has_nan:
-                print(f"Probs: {h}")
-                print(
-                    f"Outputs: {self.halt_router(h)}")
-                raise Exception("break")
-
+            lambda_n, _ = torch.sigmoid(self.halt_router(
+                h)).squeeze(-1).min(dim=-1)
             p_n = unhalted_prob * lambda_n
             unhalted_prob = unhalted_prob * (1 - lambda_n)
             p.append(p_n)
 
-            if lambda_n > 0.5:
+            halt = dist.Bernoulli(lambda_n).sample().item()
+            if halt == 1.0:
                 break
 
             blocks_used += self.forward_width
@@ -405,11 +399,14 @@ class Transformer(nn.Module):
                 topk_token_block_probabilities, p=1, dim=-1)
 
             # pass the tokens through the topk blocks, then sum based on the token block probabilities
+            capacity = 1.0 if i % 2 == 0 else self.capacity
             block_outputs = torch.stack([self.blocks[block](
-                h) for block in topk_indices.flatten()], dim=1)  # (1, topk, n, m)
+                h, capacity) for block in topk_indices.flatten()], dim=1)  # (1, topk, n, m)
             block_outputs = block_outputs.transpose(1, 2)
             h = torch.einsum(
                 'bte,bteo->bto', topk_token_block_probabilities, block_outputs)
+
+            i += 1
 
             has_nan = torch.isnan(h).any().item()
             if has_nan:
