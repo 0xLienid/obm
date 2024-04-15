@@ -377,7 +377,8 @@ class Transformer(nn.Module):
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
 
-            block_outputs, next_block = self.blocks[next_block](h)
+            capacity = 1.0 if i % 2 == 0 else self.capacity
+            block_outputs, next_block = self.blocks[next_block](h, capacity)
             blocks_used += 1
 
             # blocks_used += self.forward_width
