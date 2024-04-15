@@ -180,6 +180,7 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
+        self.forward_width = args.forward_width
         self.depth_router = nn.Linear(args.dim, 1, bias=False)
         self.dr_norm = RMSNorm(1, eps=args.norm_eps)
         self.attention = CausalSelfAttention(args)
@@ -194,6 +195,8 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.next_block_router = BlockRouter(
             args.dim, args.n_layers, args.max_seq_len)
+        self.token_block_router = nn.Linear(
+            args.dim, args.n_layers, bias=False)
 
     def forward(
         self,
@@ -227,9 +230,18 @@ class TransformerBlock(nn.Module):
 
         block_logits = self.blocks_router(out)
         block_probs = gumbel_softmax(block_logits, temperature=1.0, hard=False)
-        _, block_idx = block_probs.topk(1, dim=-1, sorted=False)
+        _, block_idx = block_probs.topk(
+            self.forward_width, dim=-1, sorted=False)
 
-        return out, block_idx
+        token_block_logits = self.token_block_router(out)
+        token_block_probs = gumbel_softmax(
+            token_block_logits, temperature=1.0, hard=False)
+        topk_token_block_probs = torch.gather(token_block_probs, 2, block_idx.unsqueeze(
+            1).expand(-1, token_block_probs.size(1), -1))
+        topk_token_block_probs = F.normalize(
+            topk_token_block_probs, p=1, dim=-1)
+
+        return out, block_idx, topk_token_block_probs
 
 
 # class Region(nn.Module):
@@ -343,7 +355,7 @@ class Transformer(nn.Module):
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
 
-        h, next_block = self.preprocessing_block(h)
+        h, next_blocks, token_block_probs = self.preprocessing_block(h)
 
         i = 0
         unhalted_prob = 1.0
@@ -356,12 +368,12 @@ class Transformer(nn.Module):
                        for _ in range(self.max_block_usage)]
 
         while blocks_used <= self.max_block_usage:
-            # if last_block_set is not None:
-            #     # get embeddings for the last block set and add them to each token in the sequence
-            #     block_emb = self.block_embeddings(torch.tensor(
-            #         last_block_set, dtype=torch.int, device=h.device)).unsqueeze(1)
-            #     block_emb = block_emb.sum(dim=0).unsqueeze(0)
-            #     h = h + block_emb
+            if last_block_set is not None:
+                # get embeddings for the last block set and add them to each token in the sequence
+                block_emb = self.block_embeddings(torch.tensor(
+                    last_block_set, dtype=torch.int, device=h.device)).unsqueeze(1)
+                block_emb = block_emb.sum(dim=0).unsqueeze(0)
+                h = h + block_emb
 
             if blocks_used == self.max_block_usage:
                 lambda_n = torch.tensor(1.0, dtype=h.dtype, device=h.device)
@@ -377,56 +389,37 @@ class Transformer(nn.Module):
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
 
-            block_outputs, next_block = self.blocks[next_block](h)
-            blocks_used += 1
+            blocks_used += self.forward_width
 
-            # blocks_used += self.forward_width
-
-            # logits = self.blocks_router(
-            #     h)  # (1, n_layers)
-            # probabilities = gumbel_softmax(
-            #     logits, temperature=1.0, hard=False)  # (1, n_layers)
-            # _, topk_indices = probabilities.topk(
-            #     self.forward_width, dim=-1, sorted=False)
-
-            # token_block_logits = self.token_block_router(
-            #     h)  # (1, n, n_layers)
-            # token_block_probabilities = gumbel_softmax(
-            #     token_block_logits, temperature=1.0, hard=False)  # (1, n, n_layers)
-            # topk_token_block_probabilities = torch.gather(token_block_probabilities, 2, topk_indices.unsqueeze(
-            #     1).expand(-1, token_block_probabilities.size(1), -1))
-            # topk_token_block_probabilities = F.normalize(
-            #     topk_token_block_probabilities, p=1, dim=-1)
-
-            # # pass the tokens through the topk blocks, then sum based on the token block probabilities
-            # capacity = 1.0 if i % 2 == 0 else self.capacity
-            # block_outputs = torch.stack([self.blocks[block](
-            #     h, capacity) for block in topk_indices.flatten()], dim=1)  # (1, topk, n, m)
-            # block_outputs = block_outputs.transpose(1, 2)
-            # block_outputs = torch.einsum(
-            #     'bte,bteo->bto', topk_token_block_probabilities, block_outputs)
+            # pass the tokens through the topk blocks, then sum based on the token block probabilities
+            capacity = 1.0 if i % 2 == 0 else self.capacity
+            block_outputs = torch.stack([self.blocks[block](
+                h, capacity) for block in next_blocks.flatten()], dim=1)  # (1, topk, n, m)
+            block_outputs = block_outputs.transpose(1, 2)
+            block_outputs = torch.einsum(
+                'bte,bteo->bto', token_block_probs, block_outputs)
 
             h = h * (1 - halt) + block_outputs * halt
 
             i += 1
             halted = halted + halt
 
-            # last_block_set = topk_indices.flatten().tolist()
-            # replaced = False
-            # for i, row in enumerate(last_blocks):
-            #     if row == [-1] * self.forward_width:
-            #         last_blocks[i] = topk_indices.flatten().tolist()
-            #         replaced = True
-            #         break
-            # if not replaced:
-            #     last_blocks.pop(0)
-            #     last_blocks.append(topk_indices.flatten().tolist())
+            last_block_set = next_blocks.flatten().tolist()
+            replaced = False
+            for i, row in enumerate(last_blocks):
+                if row == [-1] * self.forward_width:
+                    last_blocks[i] = next_blocks.flatten().tolist()
+                    replaced = True
+                    break
+            if not replaced:
+                last_blocks.pop(0)
+                last_blocks.append(next_blocks.flatten().tolist())
 
-            # has_nan = torch.isnan(h).any().item()
-            # if has_nan:
-            #     print(f"Probs: {topk_token_block_probabilities}")
-            #     print(f"Outputs: {block_outputs}")
-            #     raise Exception("break")
+            has_nan = torch.isnan(h).any().item()
+            if has_nan:
+                print(f"Probs: {token_block_probs}")
+                print(f"Outputs: {block_outputs}")
+                raise Exception("break")
 
         h = self.postprocessing_block(h)
         h = self.norm(h)
