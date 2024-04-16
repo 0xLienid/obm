@@ -16,6 +16,7 @@ class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
     forward_width: int = 2
+    working_memory_size: int = 256
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = 32000
@@ -201,6 +202,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
+        working_mem,
         capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
@@ -215,25 +217,27 @@ class TransformerBlock(nn.Module):
         weights = torch.gather(weights, dim=1, index=index)
         indices_expanded = selected_tokens.expand(-1, -1, m)
         x_input = torch.gather(x, 1, indices_expanded)
+        x_input = torch.cat((x_input, working_mem), dim=1)
 
         h = x_input + \
             self.attention.forward(
                 self.attention_norm(x_input))
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        out_working_mem = h + self.feed_forward.forward(self.ffn_norm(h))
 
         out = torch.scatter_add(
             x,
             dim=1,
             index=indices_expanded,
-            src=out * weights,
+            src=out_working_mem[:, :capacity, :] * weights,
         )
+        working_mem = out[:, n:, :]
 
-        block_logits = self.blocks_router(out)
+        block_logits = self.blocks_router(out_working_mem)
         block_probs = gumbel_softmax(block_logits, temperature=1.0, hard=False)
         _, block_idx = block_probs.topk(
             self.forward_width, dim=-1, sorted=False)
 
-        token_block_logits = self.token_block_router(out)
+        token_block_logits = self.token_block_router(out_working_mem)
         token_block_probs = gumbel_softmax(
             token_block_logits, temperature=1.0, hard=False)
         topk_token_block_probs = torch.gather(token_block_probs, 2, block_idx.unsqueeze(
@@ -241,7 +245,7 @@ class TransformerBlock(nn.Module):
         topk_token_block_probs = F.normalize(
             topk_token_block_probs, p=1, dim=-1)
 
-        return out, block_idx, topk_token_block_probs
+        return out, working_mem, block_idx, topk_token_block_probs
 
 
 # class Region(nn.Module):
@@ -275,6 +279,7 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
         self.forward_width = params.forward_width
+        self.working_memory_size = params.working_memory_size
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.pos_embeddings = nn.Embedding(params.max_seq_len, params.dim)
@@ -349,13 +354,16 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        _, seqlen = tokens.shape
+        bsz, seqlen, dim = tokens.shape
         h = self.tok_embeddings(tokens)
         pos_emb = self.pos_embeddings(torch.arange(
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
+        working_mem = torch.zeros(
+            bsz, self.working_memory_size, dim, dtype=h.dtype, device=h.device)
 
-        h, next_blocks, token_block_probs = self.preprocessing_block(h)
+        h, working_mem, next_blocks, token_block_probs = self.preprocessing_block(
+            h, working_mem)
 
         i = 0
         unhalted_prob = 1.0
@@ -393,13 +401,40 @@ class Transformer(nn.Module):
 
             # pass the tokens through the topk blocks, then sum based on the token block probabilities
             capacity = 1.0 if i % 2 == 0 else self.capacity
-            block_outputs = torch.stack([self.blocks[block](
-                h, capacity) for block in next_blocks.flatten()], dim=1)  # (1, topk, n, m)
+            all_outputs = [self.blocks[block](
+                h, working_mem, capacity) for block in next_blocks.flatten()]
+
+            block_outputs = torch.stack([output[0]
+                                        for output in all_outputs], dim=1)
+            working_mem_outputs = torch.stack(
+                [output[1] for output in all_outputs], dim=1)
+            block_idx_outputs = torch.stack(
+                [output[2] for output in all_outputs], dim=1)
+            token_block_probs_outputs = torch.stack(
+                [output[3] for output in all_outputs], dim=1)
+
             block_outputs = block_outputs.transpose(1, 2)
             block_outputs = torch.einsum(
                 'bte,bteo->bto', token_block_probs, block_outputs)
 
+            working_mem_outputs = working_mem_outputs.transpose(1, 2)
+            working_mem_outputs = torch.einsum(
+                'bte,bteo->bto', token_block_probs, working_mem_outputs)
+
+            block_idx_outputs = block_idx_outputs.transpose(1, 2)
+            block_idx_outputs = torch.einsum(
+                'bte,bteo->bto', token_block_probs, block_idx_outputs)
+
+            token_block_probs_outputs = token_block_probs_outputs.transpose(
+                1, 2)
+            token_block_probs_outputs = torch.einsum(
+                'bte,bteo->bto', token_block_probs, token_block_probs_outputs)
+
             h = h * (1 - halt) + block_outputs * halt
+            working_mem = working_mem * (1 - halt) + working_mem_outputs * halt
+            next_blocks = next_blocks * (1 - halt) + block_idx_outputs * halt
+            token_block_probs = token_block_probs * \
+                (1 - halt) + token_block_probs_outputs * halt
 
             i += 1
             halted = halted + halt
