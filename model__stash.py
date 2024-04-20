@@ -198,6 +198,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
+        x_token,
         capacity: float = 1.0,
         attn_mask: Optional[torch.Tensor] = None
     ):
@@ -215,7 +216,7 @@ class TransformerBlock(nn.Module):
 
         h = x_input + \
             self.attention.forward(
-                self.attention_norm(x_input))
+                self.attention_norm(x_input * x_token))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
 
         out = torch.scatter_add(
@@ -342,8 +343,9 @@ class Transformer(nn.Module):
         pos_emb = self.pos_embeddings(torch.arange(
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
+        x_token = h
 
-        h, next_block = self.preprocessing_block(h)
+        h, next_block = self.preprocessing_block(h, x_token)
 
         i = 0
         unhalted_prob = 1.0
@@ -379,7 +381,8 @@ class Transformer(nn.Module):
                 break
 
             capacity = 1.0 if i % 2 == 0 else self.capacity
-            block_outputs, next_block = self.blocks[next_block](h, capacity)
+            block_outputs, next_block = self.blocks[next_block](
+                h, x_token, capacity)
             blocks_used += 1
 
             # blocks_used += self.forward_width
