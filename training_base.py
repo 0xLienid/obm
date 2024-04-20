@@ -29,14 +29,14 @@ device = "cuda"
 dtype = "bfloat16"
 
 model_args = ModelArgs(
-    dim=512,
+    dim=1024,
     n_layers=32,
     n_heads=32,
     vocab_size=50257,
-    hidden_dim=2048,
+    hidden_dim=4096,
     multiple_of=256,
     norm_eps=1e-5,
-    max_seq_len=512,
+    max_seq_len=1024,
     dropout=0.0
 )
 
