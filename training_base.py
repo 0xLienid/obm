@@ -36,7 +36,7 @@ model_args = ModelArgs(
     hidden_dim=4096,
     multiple_of=256,
     norm_eps=1e-5,
-    max_seq_len=1024,
+    max_seq_len=512,
     dropout=0.0
 )
 
