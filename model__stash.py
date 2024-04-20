@@ -225,11 +225,11 @@ class TransformerBlock(nn.Module):
             src=out * weights,
         )
 
-        block_logits = self.blocks_router(out)
+        block_logits = self.next_block_router(out)
         block_probs = gumbel_softmax(block_logits, temperature=1.0, hard=False)
         _, block_idx = block_probs.topk(1, dim=-1, sorted=False)
 
-        return out, block_idx
+        return out, block_idx.to(dtype=torch.int)
 
 
 # class Region(nn.Module):
@@ -376,6 +376,7 @@ class Transformer(nn.Module):
 
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
+                break
 
             capacity = 1.0 if i % 2 == 0 else self.capacity
             block_outputs, next_block = self.blocks[next_block](h, capacity)
@@ -429,7 +430,6 @@ class Transformer(nn.Module):
             #     print(f"Outputs: {block_outputs}")
             #     raise Exception("break")
 
-        h = self.postprocessing_block(h)
         h = self.norm(h)
 
         if targets is not None:
