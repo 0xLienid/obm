@@ -19,7 +19,7 @@ batch_size = 1
 lr = 3e-4
 min_lr = 3e-5
 eval_steps = 250
-training_steps = 10000
+training_steps = 100000
 weight_decay = 0.01
 lr_decay_steps = training_steps // accumulation_steps
 grad_clip = 1.0
@@ -57,7 +57,7 @@ tokenizer = tiktoken.get_encoding("r50k_base")
 print("loading dataset...")
 dataset = load_dataset(dataset_name)
 train_batches = tokenize_dataset(
-    dataset["train"], tokenizer, model_args.max_seq_len, batch_size, 10000)
+    dataset["train"], tokenizer, model_args.max_seq_len, batch_size, 100000)
 eval_batches = tokenize_dataset(
     dataset["validation"], tokenizer, model_args.max_seq_len, batch_size, 50)
 
