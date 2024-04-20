@@ -388,18 +388,38 @@ class Transformer(nn.Module):
 
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
+                break
 
             blocks_used += self.forward_width
 
             # pass the tokens through the topk blocks, then sum based on the token block probabilities
             capacity = 1.0 if i % 2 == 0 else self.capacity
-            block_outputs = torch.stack([self.blocks[block](
-                h, capacity) for block in next_blocks.flatten()], dim=1)  # (1, topk, n, m)
+            all_outputs = [self.blocks[block](
+                h, capacity) for block in next_blocks.flatten()]
+
+            block_outputs = torch.stack([output[0]
+                                         for output in all_outputs], dim=1)  # (1, forward_width, seqlen, dim)
+            next_block_outputs = torch.stack(
+                [output[1] for output in all_outputs], dim=1)  # (1, forward_width, forward_width)
+            token_block_probs_outputs = torch.stack(
+                [output[2] for output in all_outputs], dim=1)  # (1, forward_width, seq_len, forward_width)
+
             block_outputs = block_outputs.transpose(1, 2)
             block_outputs = torch.einsum(
-                'bte,bteo->bto', token_block_probs, block_outputs)
+                "bte,bteo->bto", token_block_probs, block_outputs)
+
+            # convert next_block_outputs from (1, forward_width, forward_width) to (1, forward_width)
+            next_block_outputs = next_block_outputs.mean(dim=-1).int()
+
+            token_block_probs_outputs = token_block_probs_outputs.transpose(
+                1, 2)
+            token_block_probs_outputs = torch.einsum(
+                'bte,bteo->bto', token_block_probs, token_block_probs_outputs)
 
             h = h * (1 - halt) + block_outputs * halt
+            next_blocks = next_blocks * (1 - halt) + next_block_outputs * halt
+            token_block_probs = token_block_probs * \
+                (1 - halt) + token_block_probs_outputs * halt
 
             i += 1
             halted = halted + halt
