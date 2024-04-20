@@ -50,23 +50,25 @@ class RegularizationLoss(nn.Module):
 
 
 class BlockRouter(nn.Module):
-    def __init__(self, input_dim: int, n_blocks: int, seq_len: int):
+    def __init__(self, input_dim: int, n_blocks: int, seq_len: int, working_mem_size: int):
         super().__init__()
         self.seq_len = seq_len
+        self.working_mem_size = working_mem_size
         self.n_blocks = n_blocks
 
         self.w1 = nn.Linear(input_dim, n_blocks, bias=False)
-        self.w2 = nn.Linear(seq_len * n_blocks, n_blocks, bias=False)
+        self.w2 = nn.Linear((seq_len + working_mem_size)
+                            * n_blocks, n_blocks, bias=False)
         self.norm = RMSNorm(n_blocks, eps=1e-5)
 
     def forward(self, x):
         _, n, _ = x.shape
-        if n < self.seq_len:
-            pad_size = self.seq_len - n
+        if n < self.seq_len + self.working_mem_size:
+            pad_size = self.seq_len + self.working_mem_size - n
             x = F.pad(x, (0, 0, 0, pad_size), "constant", 0)
 
         x = self.w1(x)
-        x = x.view(-1, self.seq_len * self.n_blocks)
+        x = x.view(-1, (self.seq_len + self.working_mem_size) * self.n_blocks)
         x = self.w2(x)
         x = self.norm(x)
         return x
@@ -191,11 +193,18 @@ class TransformerBlock(nn.Module):
             multiple_of=args.multiple_of,
             dropout=args.dropout,
         )
+        self.wm_feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=args.hidden_dim,
+            multiple_of=args.multiple_of,
+            dropout=args.dropout,
+        )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.wm_ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.next_block_router = BlockRouter(
-            args.dim, args.n_layers, args.max_seq_len)
+            args.dim, args.n_layers, args.max_seq_len, args.working_memory_size)
         self.token_block_router = nn.Linear(
             args.dim, args.n_layers, bias=False)
 
@@ -222,28 +231,31 @@ class TransformerBlock(nn.Module):
         h = x_input + \
             self.attention.forward(
                 self.attention_norm(x_input))
-        out_working_mem = h + self.feed_forward.forward(self.ffn_norm(h))
+        h = self.feed_forward(self.ffn_norm(h[:, :capacity, :]))
+        working_mem = self.wm_feed_forward(
+            self.wm_ffn_norm(h[:, capacity:, :]))
 
         out = torch.scatter_add(
             x,
             dim=1,
             index=indices_expanded,
-            src=out_working_mem[:, :capacity, :] * weights,
+            src=h * weights,
         )
-        working_mem = out[:, n:, :]
 
-        block_logits = self.blocks_router(out_working_mem)
+        block_logits = self.next_block_router(
+            torch.cat((h, working_mem), dim=1))
         block_probs = gumbel_softmax(block_logits, temperature=1.0, hard=False)
         _, block_idx = block_probs.topk(
-            self.forward_width, dim=-1, sorted=False)
+            1, dim=-1, sorted=False)
 
-        token_block_logits = self.token_block_router(out_working_mem)
-        token_block_probs = gumbel_softmax(
-            token_block_logits, temperature=1.0, hard=False)
-        topk_token_block_probs = torch.gather(token_block_probs, 2, block_idx.unsqueeze(
-            1).expand(-1, token_block_probs.size(1), -1))
-        topk_token_block_probs = F.normalize(
-            topk_token_block_probs, p=1, dim=-1)
+        # token_block_logits = self.token_block_router(out_working_mem)
+        # token_block_probs = gumbel_softmax(
+        #     token_block_logits, temperature=1.0, hard=False)
+        # topk_token_block_probs = torch.gather(token_block_probs, 2, block_idx.unsqueeze(
+        #     1).expand(-1, token_block_probs.size(1), -1))
+        # topk_token_block_probs = F.normalize(
+        #     topk_token_block_probs, p=1, dim=-1)
+        topk_token_block_probs = None
 
         return out, working_mem, block_idx, topk_token_block_probs
 
@@ -289,7 +301,7 @@ class Transformer(nn.Module):
         self.halt_router = HaltRouter(
             params.dim, params.max_seq_len)
         self.blocks_router = BlockRouter(
-            params.dim, params.n_layers, params.max_seq_len)
+            params.dim, params.n_layers, params.max_seq_len, params.working_memory_size)
         self.token_block_router = nn.Linear(
             params.dim, params.n_layers, bias=False)
         self.blocks = torch.nn.ModuleList()
@@ -354,15 +366,17 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        bsz, seqlen, dim = tokens.shape
+        bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         pos_emb = self.pos_embeddings(torch.arange(
             0, seqlen, dtype=tokens.dtype, device=tokens.device).unsqueeze(0))
         h = self.dropout(h + pos_emb)
+
+        _, _, dim = h.shape
         working_mem = torch.zeros(
             bsz, self.working_memory_size, dim, dtype=h.dtype, device=h.device)
 
-        h, working_mem, next_blocks, token_block_probs = self.preprocessing_block(
+        h, working_mem, next_block, _ = self.preprocessing_block(
             h, working_mem)
 
         i = 0
@@ -396,67 +410,71 @@ class Transformer(nn.Module):
 
             if halt.item() == 1.0:
                 blocks_used_at_halt = blocks_used
+                break
 
             blocks_used += self.forward_width
 
             # pass the tokens through the topk blocks, then sum based on the token block probabilities
             capacity = 1.0 if i % 2 == 0 else self.capacity
-            all_outputs = [self.blocks[block](
-                h, working_mem, capacity) for block in next_blocks.flatten()]
+            block_output, working_mem_output, next_block_output, _ = self.blocks[next_block](
+                h, working_mem, capacity)
 
-            block_outputs = torch.stack([output[0]
-                                        for output in all_outputs], dim=1)
-            working_mem_outputs = torch.stack(
-                [output[1] for output in all_outputs], dim=1)
-            block_idx_outputs = torch.stack(
-                [output[2] for output in all_outputs], dim=1)
-            token_block_probs_outputs = torch.stack(
-                [output[3] for output in all_outputs], dim=1)
+            # all_outputs = [self.blocks[block](
+            #     h, working_mem, capacity) for block in next_blocks.flatten()]
 
-            block_outputs = block_outputs.transpose(1, 2)
-            block_outputs = torch.einsum(
-                'bte,bteo->bto', token_block_probs, block_outputs)
+            # block_outputs = torch.stack([output[0]
+            #                             for output in all_outputs], dim=1)
+            # working_mem_outputs = torch.stack(
+            #     [output[1] for output in all_outputs], dim=1)
+            # block_idx_outputs = torch.stack(
+            #     [output[2] for output in all_outputs], dim=1)
+            # token_block_probs_outputs = torch.stack(
+            #     [output[3] for output in all_outputs], dim=1)
 
-            working_mem_outputs = working_mem_outputs.transpose(1, 2)
-            working_mem_outputs = torch.einsum(
-                'bte,bteo->bto', token_block_probs, working_mem_outputs)
+            # block_outputs = block_outputs.transpose(1, 2)
+            # block_outputs = torch.einsum(
+            #     'bte,bteo->bto', token_block_probs[:, :seqlen, :], block_outputs)
 
-            block_idx_outputs = block_idx_outputs.transpose(1, 2)
-            block_idx_outputs = torch.einsum(
-                'bte,bteo->bto', token_block_probs, block_idx_outputs)
+            # working_mem_outputs = working_mem_outputs.transpose(1, 2)
+            # working_mem_outputs = torch.einsum(
+            #     'bte,bteo->bto', token_block_probs[:, seqlen:, :], working_mem_outputs)
 
-            token_block_probs_outputs = token_block_probs_outputs.transpose(
-                1, 2)
-            token_block_probs_outputs = torch.einsum(
-                'bte,bteo->bto', token_block_probs, token_block_probs_outputs)
+            # block_idx_outputs = block_idx_outputs.transpose(1, 2)
+            # block_idx_outputs = torch.einsum(
+            #     'bte,bteo->bto', token_block_probs, block_idx_outputs)
 
-            h = h * (1 - halt) + block_outputs * halt
-            working_mem = working_mem * (1 - halt) + working_mem_outputs * halt
-            next_blocks = next_blocks * (1 - halt) + block_idx_outputs * halt
-            token_block_probs = token_block_probs * \
-                (1 - halt) + token_block_probs_outputs * halt
+            # token_block_probs_outputs = token_block_probs_outputs.transpose(
+            #     1, 2)
+            # token_block_probs_outputs = torch.einsum(
+            #     'bte,bteo->bto', token_block_probs, token_block_probs_outputs)
+
+            h = h * (1 - halt) + block_output * halt
+            working_mem = working_mem * (1 - halt) + working_mem_output * halt
+            next_block = next_block * (1 - halt) + next_block_output * halt
+            next_block = next_block.to(dtype=torch.int)
+            # token_block_probs = token_block_probs * \
+            #     (1 - halt) + token_block_probs_outputs * halt
 
             i += 1
             halted = halted + halt
 
-            last_block_set = next_blocks.flatten().tolist()
+            last_block_set = next_block.flatten().tolist()
             replaced = False
             for i, row in enumerate(last_blocks):
                 if row == [-1] * self.forward_width:
-                    last_blocks[i] = next_blocks.flatten().tolist()
+                    last_blocks[i] = next_block.flatten().tolist()
                     replaced = True
                     break
             if not replaced:
                 last_blocks.pop(0)
-                last_blocks.append(next_blocks.flatten().tolist())
+                last_blocks.append(next_block.flatten().tolist())
 
             has_nan = torch.isnan(h).any().item()
             if has_nan:
-                print(f"Probs: {token_block_probs}")
-                print(f"Outputs: {block_outputs}")
+                # print(f"Probs: {token_block_probs}")
+                print(f"Outputs: {block_output}")
                 raise Exception("break")
 
-        h = self.postprocessing_block(h)
         h = self.norm(h)
 
         if targets is not None:
